@@ -46,10 +46,11 @@ from qgis.PyQt.QtWidgets import (
     QFrame,
     QScrollArea,
     QAbstractItemView,
+    QApplication,
 )
 
 from .tasks import CbersWpmTask, CbersWpmSearchTask
-from .core.pipeline import fetch_thumbnail_bytes
+from .core.pipeline import fetch_thumbnail_bytes, check_entire_tile_resources, PipelineError
 
 FIXED_THREADS = 1
 FIXED_CONTRAST_STRETCH = 800
@@ -153,6 +154,11 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QDateEdit, QPlainTextEdit, QTabl
     color: #2c2f33;
     selection-background-color: #cdeade;
     selection-color: #1f5c42;
+}
+QSpinBox:disabled, QDoubleSpinBox:disabled {
+    background: #f5f6f7;
+    color: #b7bbc0;
+    border: 1px solid #edeef1;
 }
 QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover, QDateEdit:hover {
     border: 1px solid #d7dbdf;
@@ -261,6 +267,9 @@ QCheckBox {
     color: #3c4046;
     spacing: 8px;
 }
+QCheckBox:disabled, QLabel:disabled {
+    color: #b7bbc0;
+}
 QFrame#headerFrame {
     background-color: transparent;
     border-bottom: 1px solid #eef0f2;
@@ -348,6 +357,11 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QDateEdit, QPlainTextEdit, QTabl
     color: #e4e6eb;
     selection-background-color: #2f5d47;
     selection-color: #d7ffe9;
+}
+QSpinBox:disabled, QDoubleSpinBox:disabled {
+    background: #26282c;
+    color: #6b6f75;
+    border: 1px solid #35373c;
 }
 QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover, QDateEdit:hover {
     border: 1px solid #4a4d52;
@@ -457,6 +471,9 @@ QCheckBox {
     color: #c7c9cd;
     spacing: 8px;
 }
+QCheckBox:disabled, QLabel:disabled {
+    color: #6b6f75;
+}
 QFrame#headerFrame {
     background-color: transparent;
     border-bottom: 1px solid #35373c;
@@ -491,6 +508,10 @@ class CbersWpmDialog(QDialog):
         self.search_task = None
         self.available_scenes = {}
         self._thumb_worker = None
+        self.pending_runs = []
+        self._run_index = 0
+        self._all_outputs = []
+        self._run_cancelled = False
 
         self.setWindowTitle("WPM 1-meter spatial resolution")
         icon_path = os.path.join(PLUGIN_DIR, "icons", "icon.png")
@@ -576,7 +597,7 @@ class CbersWpmDialog(QDialog):
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(2, 2, 2, 2)
 
-        group = QGroupBox("Origem da Área de Interesse (ROI)")
+        group = QGroupBox("Área de Interesse (ROI)")
         group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         glayout = QVBoxLayout(group)
 
@@ -592,12 +613,12 @@ class CbersWpmDialog(QDialog):
             glayout.addWidget(rb)
 
         self.roi_stack = QStackedWidget()
-        self.roi_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.roi_stack.setMinimumHeight(170)
+        self.roi_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         glayout.addWidget(self.roi_stack)
 
         file_page = QWidget()
         file_layout = QFormLayout(file_page)
+        file_layout.setContentsMargins(0, 0, 0, 0)
         self.roi_file_widget = QgsFileWidget()
         self.roi_file_widget.setStorageMode(QgsFileWidget.GetFile)
         self.roi_file_widget.setFilter("Vetores (*.gpkg *.shp);;GeoPackage (*.gpkg);;Shapefile (*.shp)")
@@ -606,6 +627,7 @@ class CbersWpmDialog(QDialog):
 
         single_coord_page = QWidget()
         single_coord_layout = QFormLayout(single_coord_page)
+        single_coord_layout.setContentsMargins(0, 0, 0, 0)
 
         self.single_lat_edit = QLineEdit()
         self.single_lat_edit.setPlaceholderText("-15.7942")
@@ -627,10 +649,27 @@ class CbersWpmDialog(QDialog):
 
         self.roi_stack.addWidget(single_coord_page)
 
-        layout.addWidget(group, stretch=1)
+        layout.addWidget(group)
+
+        self.extent_group = QGroupBox("Extensão do Processamento")
+        extent_layout = QVBoxLayout(self.extent_group)
+
+        self.process_entire_tile_check = QCheckBox(
+            "Processar o tile inteiro")
+        extent_layout.addWidget(self.process_entire_tile_check)
+
+        entire_tile_hint = QLabel(
+            "Atenção: exige mais memória RAM e espaço de armazenamento em disco.")
+        entire_tile_hint.setProperty("hint", "true")
+        entire_tile_hint.setWordWrap(True)
+        extent_layout.addWidget(entire_tile_hint)
+
+        layout.addWidget(self.extent_group)
 
         self.radio_roi_file.toggled.connect(lambda c: c and self.roi_stack.setCurrentIndex(0))
         self.radio_roi_single_coord.toggled.connect(lambda c: c and self.roi_stack.setCurrentIndex(1))
+
+        layout.addStretch(1)
 
         return widget
 
@@ -641,15 +680,28 @@ class CbersWpmDialog(QDialog):
         search_group = QGroupBox("Busca de Cenas Disponíveis")
         search_form = QFormLayout(search_group)
 
-        self.approx_date_edit = QDateEdit()
-        self.approx_date_edit.setCalendarPopup(True)
-        self.approx_date_edit.setDisplayFormat("dd/MM/yyyy")
-        self.approx_date_edit.setDate(QDate.currentDate())
-        self.approx_date_edit.setMaximumWidth(120)
-        search_form.addRow("Data aproximada:", self.approx_date_edit)
+        self.start_date_edit = QDateEdit()
+        self.start_date_edit.setCalendarPopup(True)
+        self.start_date_edit.setDisplayFormat("dd/MM/yyyy")
+        self.start_date_edit.setDate(QDate.currentDate().addDays(-FIXED_SEARCH_WINDOW_DAYS))
+        self.start_date_edit.setMaximumWidth(120)
+
+        self.end_date_edit = QDateEdit()
+        self.end_date_edit.setCalendarPopup(True)
+        self.end_date_edit.setDisplayFormat("dd/MM/yyyy")
+        self.end_date_edit.setDate(QDate.currentDate())
+        self.end_date_edit.setMaximumWidth(120)
+
+        date_range_row = QHBoxLayout()
+        date_range_row.addWidget(self.start_date_edit)
+        date_range_row.addWidget(QLabel("até"))
+        date_range_row.addWidget(self.end_date_edit)
+        date_range_row.addStretch(1)
+        search_form.addRow("Período de busca:", date_range_row)
 
         search_row = QHBoxLayout()
         self.search_button = QPushButton("🔍 Buscar imagens disponíveis")
+        self.search_button.setStyleSheet("QPushButton { font-weight: normal; }")
         self.search_button.clicked.connect(self._search_scenes)
         search_row.addWidget(self.search_button)
         self.search_status_label = QLabel("")
@@ -690,7 +742,7 @@ class CbersWpmDialog(QDialog):
         self.tclt_exe_widget = QgsFileWidget()
         self.tclt_exe_widget.setStorageMode(QgsFileWidget.GetFile)
         self.tclt_exe_widget.setFilter("Executável (*.exe)")
-        tclt_form.addRow("Executável tclt_exe.exe:", self.tclt_exe_widget)
+        tclt_form.addRow("Executável tclt.exe:", self.tclt_exe_widget)
 
         layout.addWidget(tclt_group)
         layout.addStretch(1)
@@ -700,7 +752,7 @@ class CbersWpmDialog(QDialog):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        type_group = QGroupBox("Produtos a Serem Gerados e Carregados")
+        type_group = QGroupBox("Produtos")
         type_form = QFormLayout(type_group)
 
         self.gen_rgb_check = QCheckBox("Visualização RGB (PCA / Fusão Pancromática)")
@@ -713,7 +765,7 @@ class CbersWpmDialog(QDialog):
 
         layout.addWidget(type_group)
 
-        out_group = QGroupBox("Pasta e Contraste")
+        out_group = QGroupBox("Diretório")
         out_form = QFormLayout(out_group)
         self.output_dir_widget = QgsFileWidget()
         self.output_dir_widget.setStorageMode(QgsFileWidget.GetDirectory)
@@ -727,23 +779,26 @@ class CbersWpmDialog(QDialog):
         self.radio_format_group = QButtonGroup(self)
         self.radio_tiff = QRadioButton("GeoTIFF")
         self.radio_jp2 = QRadioButton("JPEG2000 (JP2)")
+        for rb in (self.radio_tiff, self.radio_jp2):
+            rb.setStyleSheet("QRadioButton { font-weight: normal; }")
         self.radio_jp2.setChecked(True)
         self.radio_format_group.addButton(self.radio_tiff, 0)
         self.radio_format_group.addButton(self.radio_jp2, 1)
         format_row.addWidget(self.radio_tiff)
         format_row.addWidget(self.radio_jp2)
         format_row.addStretch(1)
-        format_form.addRow("Formato de saída:", format_row)
+        format_form.addRow("Formato:", format_row)
 
         self.lossless_check = QCheckBox("Sem perdas (lossless)")
         self.lossless_check.setChecked(True)
+        self.jp2_quality_label = QLabel("Qualidade JP2:")
         self.jp2_quality_spin = QSpinBox()
         self.jp2_quality_spin.setRange(1, 100)
         self.jp2_quality_spin.setValue(100)
         jp2_row = QHBoxLayout()
         jp2_row.addWidget(self.lossless_check)
         jp2_row.addSpacing(20)
-        jp2_row.addWidget(QLabel("Qualidade JP2:"))
+        jp2_row.addWidget(self.jp2_quality_label)
         jp2_row.addWidget(self.jp2_quality_spin)
         jp2_row.addStretch(1)
         format_form.addRow("", jp2_row)
@@ -760,7 +815,9 @@ class CbersWpmDialog(QDialog):
     def _update_format_controls(self):
         is_jp2 = self.radio_jp2.isChecked()
         self.lossless_check.setEnabled(is_jp2)
-        self.jp2_quality_spin.setEnabled(is_jp2 and not self.lossless_check.isChecked())
+        quality_enabled = is_jp2 and not self.lossless_check.isChecked()
+        self.jp2_quality_spin.setEnabled(quality_enabled)
+        self.jp2_quality_label.setEnabled(quality_enabled)
 
     def _build_log_tab(self):
         widget = QWidget()
@@ -820,6 +877,8 @@ class CbersWpmDialog(QDialog):
             box_side_km = min(max(self.buffer_distance_spin.value(), POINT_BUFFER_MIN_KM), POINT_BUFFER_MAX_KM)
             params["roi_coordinates"] = self._build_bounding_box_coords(lon, lat, box_side_km / 2.0)
 
+        params["process_entire_tile"] = self.process_entire_tile_check.isChecked()
+
         return params
 
     def _search_scenes(self):
@@ -829,9 +888,15 @@ class CbersWpmDialog(QDialog):
             QMessageBox.warning(self, "ROI incompleto", str(exc))
             return
 
+        start_qdate = self.start_date_edit.date()
+        end_qdate = self.end_date_edit.date()
+        if start_qdate > end_qdate:
+            QMessageBox.warning(self, "Período inválido", "A data inicial não pode ser posterior à data final.")
+            return
+
         params = dict(roi_params)
-        params["target_date"] = self.approx_date_edit.date().toString("yyyy-MM-dd")
-        params["search_window_days"] = FIXED_SEARCH_WINDOW_DAYS
+        params["date_start"] = start_qdate.toString("yyyy-MM-dd")
+        params["date_end"] = end_qdate.toString("yyyy-MM-dd")
 
         self.scene_table.setRowCount(0)
         self.available_scenes = {}
@@ -853,7 +918,7 @@ class CbersWpmDialog(QDialog):
             self.search_status_label.setText("{} cena(s) encontrada(s).".format(len(results)))
         else:
             self.search_status_label.setText(
-                "Nenhuma cena encontrada nessa janela - tente ampliar os dias de busca ou revisar o ROI.")
+                "Nenhuma cena encontrada nesse período - tente ampliar o período de busca ou revisar o ROI.")
         self.search_button.setEnabled(True)
         self.run_button.setEnabled(True)
         self.search_task = None
@@ -880,7 +945,7 @@ class CbersWpmDialog(QDialog):
             date_item.setData(Qt.UserRole, entry["id"])
             self.scene_table.setItem(row, 0, date_item)
             self.scene_table.setItem(row, 1, QTableWidgetItem(tile_txt))
-            self.scene_table.setItem(row, 2, QTableWidgetItem(str(entry["days_from_target"])))
+            self.scene_table.setItem(row, 2, QTableWidgetItem(str(entry["days_from_start"])))
 
     def _selected_scene_entries(self):
         seen_ids = set()
@@ -895,20 +960,35 @@ class CbersWpmDialog(QDialog):
                 entries.append(entry)
         return entries
 
+    def _selected_scene_groups_by_date(self):
+        """Agrupa as cenas selecionadas por data. Cada grupo (data) é processado
+        como uma execução independente do pipeline; as execuções são feitas em
+        sequência, da data mais antiga para a mais recente."""
+        entries = self._selected_scene_entries()
+        groups = {}
+        for entry in entries:
+            groups.setdefault(entry["date"], []).append(entry)
+        return [(d, groups[d]) for d in sorted(groups.keys())]
+
     def _on_scene_selection_changed(self):
         entries = self._selected_scene_entries()
 
-        tiles = {}
+        per_date_tile = {}
         conflict = False
         for entry in entries:
-            tile = entry["tile"]
-            if tile in tiles and tiles[tile] != entry["id"]:
+            key = (entry["date"], entry["tile"])
+            if key in per_date_tile and per_date_tile[key] != entry["id"]:
                 conflict = True
-            tiles[tile] = entry["id"]
+            per_date_tile[key] = entry["id"]
 
+        n_dates = len(set(entry["date"] for entry in entries))
         if conflict:
             self.search_status_label.setText(
-                "Selecione apenas UMA cena por tile - há mais de uma selecionada para o mesmo tile.")
+                "Selecione apenas UMA cena por tile em cada data - há conflito de tile na mesma data.")
+        elif entries and n_dates > 1:
+            self.search_status_label.setText(
+                "{} cena(s) selecionada(s) em {} data(s) - serão processadas em sequência, "
+                "da mais antiga para a mais recente.".format(len(entries), n_dates))
         elif entries:
             self.search_status_label.setText("{} cena(s) selecionada(s).".format(len(entries)))
 
@@ -955,7 +1035,9 @@ class CbersWpmDialog(QDialog):
         self.scene_thumbnail_label.setPixmap(QPixmap())
         self.scene_thumbnail_label.setText("Erro ao carregar miniatura: {}".format(msg))
 
-    def _collect_params(self):
+    def _collect_common_params(self):
+        """Parâmetros compartilhados por todas as datas selecionadas (ROI/extensão,
+        produtos a gerar, executável TCLT, pasta e formato de saída)."""
         params = {}
 
         if not self.gen_rgb_check.isChecked() and not self.gen_ngb_check.isChecked():
@@ -966,29 +1048,9 @@ class CbersWpmDialog(QDialog):
 
         params.update(self._collect_roi_params())
 
-        entries = self._selected_scene_entries()
-        if not entries:
-            raise ValueError(
-                "Busque as imagens disponíveis (aba Processamento) e selecione ao menos uma cena antes de executar.")
-
-        stac_items = []
-        tiles_seen = {}
-        for entry in entries:
-            tile = entry["tile"]
-            if tile in tiles_seen and tiles_seen[tile] != entry["id"]:
-                raise ValueError("Selecione apenas uma cena por tile (conflito no tile {}).".format(tile))
-            tiles_seen[tile] = entry["id"]
-            stac_items.append(entry["item"])
-
-        if not stac_items:
-            raise ValueError("Nenhuma cena válida selecionada - refaça a busca e selecione novamente.")
-
-        params["stac_items"] = stac_items
-        params["target_date"] = self.approx_date_edit.date().toString("yyyy-MM-dd")
-
         tclt_exe = self.tclt_exe_widget.filePath()
         if not tclt_exe:
-            raise ValueError("Informe o caminho do executável tclt_exe.exe.")
+            raise ValueError("Informe o caminho do executável tclt.exe.")
         params["tclt_exe"] = tclt_exe
         params["threads"] = FIXED_THREADS
 
@@ -1005,25 +1067,99 @@ class CbersWpmDialog(QDialog):
 
         return params
 
+    def _collect_date_group_params(self):
+        """Retorna uma lista [(data, params), ...] - uma entrada por data
+        selecionada na tabela de cenas, em ordem cronológica (mais antiga
+        primeiro), pronta para ser processada sequencialmente."""
+        common_params = self._collect_common_params()
+
+        groups = self._selected_scene_groups_by_date()
+        if not groups:
+            raise ValueError(
+                "Busque as imagens disponíveis (aba Processamento) e selecione ao menos uma cena antes de executar.")
+
+        date_group_params = []
+        for date_str, entries in groups:
+            stac_items = []
+            tiles_seen = {}
+            for entry in entries:
+                tile = entry["tile"]
+                if tile in tiles_seen and tiles_seen[tile] != entry["id"]:
+                    raise ValueError(
+                        "Selecione apenas uma cena por tile na data {} (conflito no tile {}).".format(date_str, tile))
+                tiles_seen[tile] = entry["id"]
+                stac_items.append(entry["item"])
+
+            if not stac_items:
+                continue
+
+            params = dict(common_params)
+            params["stac_items"] = stac_items
+            params["target_date"] = date_str
+            date_group_params.append((date_str, params))
+
+        if not date_group_params:
+            raise ValueError("Nenhuma cena válida selecionada - refaça a busca e selecione novamente.")
+
+        return date_group_params
+
     def run_processing(self):
         try:
-            params = self._collect_params()
+            self.pending_runs = self._collect_date_group_params()
         except ValueError as exc:
             QMessageBox.warning(self, "Parâmetros incompletos", str(exc))
             return
 
+        if self.pending_runs and self.pending_runs[0][1].get("process_entire_tile"):
+            stac_items = []
+            seen_ids = set()
+            for _, group_params in self.pending_runs:
+                for it in group_params.get("stac_items", []):
+                    item_id = it.get("id")
+                    if item_id in seen_ids:
+                        continue
+                    seen_ids.add(item_id)
+                    stac_items.append(it)
+
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                check_entire_tile_resources(stac_items)
+            except PipelineError as exc:
+                QMessageBox.critical(self, "Recursos insuficientes", str(exc))
+                return
+            finally:
+                QApplication.restoreOverrideCursor()
+
         self._save_settings()
         self.tabs.setCurrentIndex(3)
         self.log_box.clear()
-        self._append_log("Iniciando processamento...")
+
+        total = len(self.pending_runs)
+        if total > 1:
+            self._append_log(
+                "Iniciando processamento sequencial de {} data(s): {}.".format(
+                    total, ", ".join(d for d, _ in self.pending_runs)))
+        else:
+            self._append_log("Iniciando processamento...")
 
         self.run_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress_bar.setVisible(True)
 
-        self._unload_layers_from_output_dir(params["final_output_dir"])
+        self._unload_layers_from_output_dir(self.pending_runs[0][1]["final_output_dir"])
 
-        self.task = CbersWpmTask("WPM 1-meter spatial resolution", params)
+        self._run_index = 0
+        self._all_outputs = []
+        self._run_cancelled = False
+        self._start_next_run()
+
+    def _start_next_run(self):
+        date_str, params = self.pending_runs[self._run_index]
+        total = len(self.pending_runs)
+        if total > 1:
+            self._append_log("--- Processando data {} ({}/{}) ---".format(date_str, self._run_index + 1, total))
+
+        self.task = CbersWpmTask("WPM 1-meter spatial resolution - {}".format(date_str), params)
         self.task.messageLogged.connect(self._append_log)
         self.task.taskCompleted.connect(self._on_task_finished_ok)
         self.task.taskTerminated.connect(self._on_task_finished_error)
@@ -1031,24 +1167,39 @@ class CbersWpmDialog(QDialog):
 
     def cancel_processing(self):
         if self.task is not None:
+            self._run_cancelled = True
             self.task.cancel()
             self._append_log("Cancelamento solicitado — aguardando o TCLT encerrar...")
             self.cancel_button.setEnabled(False)
 
     def _on_task_finished_ok(self):
-        self._append_log("Processamento concluído com sucesso.")
+        date_str, _ = self.pending_runs[self._run_index]
+        total = len(self.pending_runs)
         outputs = self.task.outputs or []
+        self._append_log(
+            "Data {} concluída com sucesso.".format(date_str) if total > 1 else "Processamento concluído com sucesso.")
         if outputs:
             self._append_log("Produtos gerados:")
             for p in outputs:
                 self._append_log("  • {}".format(p))
             self._load_outputs_into_qgis(outputs)
+        self._all_outputs.extend(outputs)
+
+        self._run_index += 1
+        if self._run_index < total and not self._run_cancelled:
+            self._start_next_run()
+            return
+
+        total_dates = total
+        outputs = self._all_outputs
         self._reset_run_state()
+        self.pending_runs = []
+        self._append_log("Processamento concluído com sucesso.")
         QMessageBox.information(
             self, "Concluído",
-            "Processamento concluído com sucesso.\n\n{} produto(s) gerado(s) em:\n{}\n\n"
+            "Processamento concluído com sucesso.\n\n{} produto(s) gerado(s) em {} data(s), em:\n{}\n\n"
             "Lembrete: se necessário, ajuste o contraste da imagem pelo histograma (Propriedades da Camada > Simbologia).".format(
-                len(outputs), self.output_dir_widget.filePath())
+                len(outputs), total_dates, self.output_dir_widget.filePath())
         )
 
     def _unload_layers_from_output_dir(self, output_dir):
@@ -1093,9 +1244,23 @@ class CbersWpmDialog(QDialog):
     def _on_task_finished_error(self):
         msg = self.task.error_message or "O processamento foi interrompido."
         was_user_cancel = self.task.exception is None and "cancelad" in msg.lower()
-        self._append_log("ERRO: {}".format(msg) if not was_user_cancel else "Processamento cancelado.")
+        total = len(self.pending_runs)
+        completed = self._run_index
+        date_str = self.pending_runs[self._run_index][0] if self.pending_runs else None
+
+        if was_user_cancel:
+            self._append_log("Processamento cancelado.")
+        else:
+            label = "Data {}: ".format(date_str) if total > 1 and date_str else ""
+            self._append_log("ERRO: {}{}".format(label, msg))
+
         self._reset_run_state()
+        self.pending_runs = []
+
         if not was_user_cancel:
+            if total > 1:
+                msg = "{}\n\n({} de {} data(s) processada(s) com sucesso antes do erro.)".format(
+                    msg, completed, total)
             QMessageBox.critical(self, "Erro no processamento", msg)
 
     def _reset_run_state(self):

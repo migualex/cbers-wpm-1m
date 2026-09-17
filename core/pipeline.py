@@ -131,13 +131,12 @@ def _load_and_buffer_roi(roi_shapefile, roi_coordinates, roi_buffer_km, temp_dir
     return roi_gdf, roi_vector_path
 
 def search_available_scenes(params, log=print):
-    """Busca no STAC do BDC as cenas CBERS-4A/WPM que intersectam o ROI dentro de
-    uma janela de +/- `search_window_days` em torno de `target_date` (agora tratada
-    como uma data APROXIMADA, não mais exata). Não levanta erro se nada for
-    encontrado - devolve uma lista vazia, para que a interface possa sugerir ao
-    usuário ampliar a janela ou escolher outra data, em vez de falhar direto.
+    """Busca no STAC do BDC as cenas CBERS-4A/WPM que intersectam o ROI dentro do
+    período [`date_start`, `date_end`] informado pelo usuário. Não levanta erro se
+    nada for encontrado - devolve uma lista vazia, para que a interface possa
+    sugerir ao usuário ampliar o período ou revisar o ROI, em vez de falhar direto.
 
-    Devolve uma lista de dicts, ordenada pela proximidade com `target_date`:
+    Devolve uma lista de dicts, ordenada por data (e tile):
         {id, tile, date, datetime, cloud_cover, thumbnail_url, item}
     Miniaturas NÃO são baixadas aqui (seriam N downloads por busca, a maioria
     descartada); a interface baixa sob demanda, uma por vez, ao selecionar uma
@@ -150,8 +149,15 @@ def search_available_scenes(params, log=print):
     roi_shapefile = params.get("roi_shapefile")
     roi_coordinates = params.get("roi_coordinates")
     roi_buffer_km = params.get("roi_buffer_km", 2.0)
-    target_date = params["target_date"]
-    window_days = int(params.get("search_window_days", 60))
+    date_start = params.get("date_start")
+    date_end = params.get("date_end")
+    if not date_start or not date_end:
+        raise PipelineError("Informe date_start e date_end (período de busca) na célula de configuração.")
+
+    start_dt = datetime.strptime(date_start, "%Y-%m-%d")
+    end_dt = datetime.strptime(date_end, "%Y-%m-%d")
+    if end_dt < start_dt:
+        raise PipelineError("A data final do período de busca não pode ser anterior à data inicial.")
 
     temp_dir = tempfile.mkdtemp(prefix="cbers_wpm_search_")
     try:
@@ -165,9 +171,8 @@ def search_available_scenes(params, log=print):
         def roi_intersects(other_geom_wgs84):
             return any(other_geom_wgs84.intersects(g) for g in roi_geoms_wgs84)
 
-        target_dt = datetime.strptime(target_date, "%Y-%m-%d")
-        start = (target_dt - timedelta(days=window_days)).strftime("%Y-%m-%dT00:00:00Z")
-        end   = (target_dt + timedelta(days=window_days)).strftime("%Y-%m-%dT23:59:59Z")
+        start = start_dt.strftime("%Y-%m-%dT00:00:00Z")
+        end   = end_dt.strftime("%Y-%m-%dT23:59:59Z")
 
         search_url = STAC_URL.rstrip('/') + '/search'
         query = {
@@ -176,7 +181,7 @@ def search_available_scenes(params, log=print):
             "bbox": f"{minx},{miny},{maxx},{maxy}",
             "limit": 100,
         }
-        log(f"Buscando cenas no STAC dentro de +/-{window_days} dia(s) de {target_date}...")
+        log(f"Buscando cenas no STAC entre {date_start} e {date_end}...")
         resp = requests.get(search_url, params=query, headers={"Accept": "application/json"}, timeout=60)
         resp.raise_for_status()
         feats = resp.json().get("features", [])
@@ -204,7 +209,7 @@ def search_available_scenes(params, log=print):
                 "date": date_str,
                 "datetime": props.get("datetime"),
                 "cloud_cover": cloud_cover,
-                "days_from_target": abs((item_dt - target_dt).days),
+                "days_from_start": (item_dt - start_dt).days,
                 "thumbnail_url": _get_thumbnail_href(it),
                 "item": it,
             }
@@ -225,6 +230,93 @@ def fetch_thumbnail_bytes(url, timeout=12):
     r = requests.get(url, timeout=timeout, headers={"Accept": "image/*"})
     r.raise_for_status()
     return r.content
+
+MIN_FREE_RAM_GB_FULL_TILE = 16
+
+def _estimate_entire_tile_disk_gb(stac_items, log=print):
+    """Estima o espaço em disco temporário (GB) necessário para o TCLT processar
+    o(s) tile(s) completo(s) informados, usando apenas metadados das bandas (sem
+    baixar dados de pixel). `stac_items` é uma lista de STAC Items crus (dicts),
+    como os presentes em params["stac_items"]. Devolve None se não for possível
+    estimar (nesse caso a checagem de espaço em disco é pulada, não bloqueada)."""
+    total_pixels = 0
+    try:
+        for item in stac_items:
+            assets = item.get("assets", {})
+            href = None
+            for key in ("BAND0", "band0", "Band0"):
+                if key in assets and "href" in assets[key]:
+                    href = assets[key]["href"]
+                    break
+            if href is None:
+                raise PipelineError(f"Asset BAND0 não encontrado no item {item.get('id')}.")
+            vsi_path = href
+            if vsi_path.startswith('http://') or vsi_path.startswith('https://'):
+                vsi_path = '/vsicurl/' + vsi_path
+            with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN='EMPTY_DIR'):
+                with rasterio.open(vsi_path) as src0:
+                    total_pixels += src0.width * src0.height
+    except Exception as exc:
+        log(f"Aviso: não foi possível estimar o tamanho do tile a partir dos metadados ({exc}) "
+            "- a checagem de espaço em disco será pulada.")
+        return None
+
+    if total_pixels <= 0:
+        return None
+
+    # O TCLT gera diversos produtos intermediários em resolução total ao longo do
+    # grafo (recorte, restauração de nodata, registro entre bandas, fusão PCA, RGB) -
+    # na prática, várias dezenas de cópias do tamanho de uma banda cheia (float32)
+    # circulam pela pasta temporária durante a execução. 25x é uma estimativa
+    # deliberadamente conservadora (para cima) do pico de uso de disco.
+    BYTES_PER_PIXEL_F32 = 4
+    N_BANDS = 5
+    INTERMEDIATE_COPIES_ESTIMATE = 25
+    return (total_pixels * BYTES_PER_PIXEL_F32 * N_BANDS * INTERMEDIATE_COPIES_ESTIMATE) / (1024 ** 3)
+
+def check_entire_tile_resources(stac_items, temp_dir=None, log=print):
+    """Verifica RAM livre e espaço em disco disponível ANTES de processar um tile
+    completo, e lança PipelineError de imediato se os recursos forem insuficientes -
+    interrompendo tudo, sem permitir que o processamento comece. Pode ser chamada
+    tanto pela interface (antes de iniciar o processamento, bloqueando o início)
+    quanto internamente por run_pipeline (checagem de segurança, já dentro do
+    subprocesso). `temp_dir`, se informado, é a pasta cujo volume será checado
+    quanto a espaço livre; por padrão, usa a pasta temporária padrão do sistema."""
+    try:
+        import psutil
+        avail_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
+        if avail_ram_gb < MIN_FREE_RAM_GB_FULL_TILE:
+            raise PipelineError(
+                "Memória RAM livre insuficiente para processar o tile completo ({:.1f} GB "
+                "disponíveis; recomendado no mínimo {} GB livres). Processar o tile inteiro (em "
+                "vez de uma ROI recortada) exige bem mais memória RAM, pois as bandas em resolução "
+                "total do tile precisam ser mantidas e mescladas na memória durante o processamento. "
+                "Libere recursos, feche outros programas, ou desmarque a opção \"Processar tile "
+                "inteiro\" e utilize uma ROI menor.".format(avail_ram_gb, MIN_FREE_RAM_GB_FULL_TILE))
+    except ImportError:
+        log("Aviso: biblioteca 'psutil' não encontrada - não foi possível verificar a RAM livre "
+            "antes de processar o tile completo.")
+
+    log("Consultando os metadados das bandas para estimar o espaço em disco necessário "
+        "(sem baixar os dados)...")
+    estimated_gb = _estimate_entire_tile_disk_gb(stac_items, log=log)
+    if estimated_gb is not None:
+        log(f"Estimativa de espaço temporário necessário para o TCLT processar o tile "
+            f"completo: ~{estimated_gb:.0f} GB (estimativa aproximada - o uso real depende "
+            f"do comportamento interno do TCLT).")
+        check_dir = temp_dir or tempfile.gettempdir()
+        try:
+            free_gb = shutil.disk_usage(check_dir).free / (1024 ** 3)
+        except OSError:
+            free_gb = None
+        if free_gb is not None:
+            log(f"Espaço livre na unidade correspondente: {free_gb:.1f} GB.")
+            if free_gb < estimated_gb:
+                raise PipelineError(
+                    "Espaço em disco provavelmente insuficiente para processar o tile completo: "
+                    "estima-se a necessidade de aproximadamente {:.0f} GB de espaço temporário, "
+                    "mas a unidade correspondente possui apenas "
+                    "{:.1f} GB livres.".format(estimated_gb, free_gb))
 
 def run_pipeline(params, log=print, should_cancel=None):
     """Executa o pipeline completo do CBERS-4A/WPM e retorna a lista de
@@ -275,6 +367,8 @@ def run_pipeline(params, log=print, should_cancel=None):
     os.makedirs(FINAL_OUTPUT_DIR, exist_ok=True)
     TEMP_DIR = tempfile.mkdtemp(prefix="cbers_wpm_")
     log("Diretório de trabalho temporário:", TEMP_DIR)
+
+    PROCESS_ENTIRE_TILE = bool(params.get("process_entire_tile"))
 
     try:
 
@@ -401,6 +495,18 @@ def run_pipeline(params, log=print, should_cancel=None):
 
             EFFECTIVE_DATE = TARGET_DATE
 
+        if PROCESS_ENTIRE_TILE:
+            from shapely.ops import unary_union
+            tiles_union_wgs84 = unary_union([shapely_shape(it["geometry"]) for it in selected_items.values()])
+            with _PROJ_LOCK:
+                roi_gdf = gpd.GeoDataFrame({"id": [1]}, geometry=[tiles_union_wgs84], crs=4326)
+                ROI_VECTOR_PATH = os.path.join(TEMP_DIR, "roi_full_tile.gpkg")
+                roi_gdf.to_file(ROI_VECTOR_PATH, driver="GPKG")
+            roi_geoms_wgs84 = list(roi_gdf.geometry.values)
+            _roi_crs_cache.clear()
+            log("Opção \"Processar tile inteiro\" ativada: a extensão total do(s) tile(s) selecionado(s) "
+                "será processada, sem recorte pela ROI original.")
+
         def get_band_href(item, band_idx):
             assets = item.get("assets", {})
             for key in (f"BAND{band_idx}", f"band{band_idx}", f"Band{band_idx}"):
@@ -442,6 +548,9 @@ def run_pipeline(params, log=print, should_cancel=None):
                 return '/vsicurl/' + href
             return href
 
+        if PROCESS_ENTIRE_TILE:
+            check_entire_tile_resources(list(selected_items.values()), temp_dir=TEMP_DIR, log=log)
+
         def crop_remote_band(href):
             vsi_path = to_vsicurl(href)
             with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN='EMPTY_DIR'):
@@ -481,7 +590,9 @@ def run_pipeline(params, log=print, should_cancel=None):
                             resampling=Resampling.cubic)
                         data, profile = dst_data, dst_profile
                     mf = MemoryFile()
-                    with mf.open(**profile) as ds:
+                    mem_profile = profile.copy()
+                    mem_profile.update(driver='GTiff', BIGTIFF='YES')
+                    with mf.open(**mem_profile) as ds:
                         ds.write(data)
                     mem_files.append(mf)
                     datasets.append(mf.open())
@@ -527,7 +638,9 @@ def run_pipeline(params, log=print, should_cancel=None):
 
             out_profile = profile.copy()
             out_profile.update(count=1, dtype='float32', transform=shifted_transform,
-                                compress='lzw', nodata=nodata)
+                                driver='GTiff', compress='lzw', predictor=3, tiled=True,
+                                blockxsize=512, blockysize=512, num_threads='ALL_CPUS',
+                                BIGTIFF='YES', nodata=nodata)
 
             out_path = os.path.join(TEMP_DIR, f"{SCENE_ID}_BAND{band_idx}_FD_Elev_Shift.tif")
             with rasterio.open(out_path, 'w', **out_profile) as dst:
@@ -1047,7 +1160,8 @@ def run_pipeline(params, log=print, should_cancel=None):
 
         def crop_to_final_roi(arr, nodata_val):
             mem_profile = pca_profile.copy()
-            mem_profile.update(count=arr.shape[0], dtype=arr.dtype, nodata=nodata_val)
+            mem_profile.update(count=arr.shape[0], dtype=arr.dtype, nodata=nodata_val,
+                                driver='GTiff', BIGTIFF='YES')
             with MemoryFile() as mf:
                 with mf.open(**mem_profile) as ds:
                     ds.write(arr)
@@ -1061,10 +1175,14 @@ def run_pipeline(params, log=print, should_cancel=None):
         rgb_cropped, rgb_profile = crop_to_final_roi(rgb_uint8, 0)
 
         nrgb_tmp_path = os.path.join(TEMP_DIR, "computed_NRGB.tif")
+        nrgb_profile.update(driver='GTiff', BIGTIFF='YES', tiled=True,
+                             blockxsize=512, blockysize=512, num_threads='ALL_CPUS')
         with rasterio.open(nrgb_tmp_path, 'w', **nrgb_profile) as dst:
             dst.write(nrgb_cropped)
 
         rgb_tmp_path = os.path.join(TEMP_DIR, f"computed_RGB_{CONTRAST_STRETCH}.tif")
+        rgb_profile.update(driver='GTiff', BIGTIFF='YES', tiled=True,
+                            blockxsize=512, blockysize=512, num_threads='ALL_CPUS')
         with rasterio.open(rgb_tmp_path, 'w', **rgb_profile) as dst:
             dst.write(rgb_cropped)
 
@@ -1160,7 +1278,8 @@ def run_pipeline(params, log=print, should_cancel=None):
                     profile.pop(k, None)
                 dst_path = os.path.splitext(dst_path)[0] + '.tif'
                 zstd_profile = profile.copy()
-                zstd_profile.update(compress='ZSTD', zstd_level=22, predictor=2, num_threads='ALL_CPUS')
+                zstd_profile.update(compress='ZSTD', zstd_level=22, predictor=2,
+                                     num_threads='ALL_CPUS', BIGTIFF='YES')
                 try:
                     with rasterio.open(dst_path, 'w', **zstd_profile) as dst:
                         dst.write(arr)
@@ -1168,7 +1287,7 @@ def run_pipeline(params, log=print, should_cancel=None):
                 except Exception as e:
                     log(f"  Compressão ZSTD indisponível nesta versão do GDAL ({e}); usando DEFLATE nível 9 como alternativa.")
                     deflate_profile = profile.copy()
-                    deflate_profile.update(compress='DEFLATE', zlevel=9, predictor=2)
+                    deflate_profile.update(compress='DEFLATE', zlevel=9, predictor=2, BIGTIFF='YES')
                     with rasterio.open(dst_path, 'w', **deflate_profile) as dst:
                         dst.write(arr)
                     label = 'GTiff + DEFLATE (level 9, lossless)'
