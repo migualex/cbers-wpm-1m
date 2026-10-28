@@ -8,7 +8,7 @@ Roda o WPM 1 m no BDC-Lab pelo terminal, sem QGIS: 3 arquivos, 1 configuração,
 | --- | --- |
 | `202608131245_tclt_Ubuntu2404LTS.zip` (TCLT) | Descompactar em `/home/jovyan/tclt` |
 | `tclt_runtime_ubuntu2404.tar.xz` | `/home/jovyan/` (não descompactar) |
-| `wpm_bdc.py` | `/home/jovyan/` |
+| `wpm_download.py` | `/home/jovyan/` |
 
 ```bash
 cd ~
@@ -18,7 +18,7 @@ ls ~/tclt        # deve mostrar: bin include lib share
 
 ## 2. Configurar
 
-Abra o `wpm_bdc.py`, edite só o bloco `CONFIGURATION` no topo e salve (Ctrl+S).
+Abra o `wpm_download.py`, edite só o bloco `CONFIGURATION` no topo e salve (Ctrl+S).
 
 | Variável | Valor |
 | --- | --- |
@@ -35,9 +35,9 @@ Abra o `wpm_bdc.py`, edite só o bloco `CONFIGURATION` no topo e salve (Ctrl+S).
 
 ```bash
 conda activate geospatial
-python ~/wpm_bdc.py check     # 1ª vez descompacta o pacote; deve terminar em "RESULT: ready"
-python ~/wpm_bdc.py search    # lista as cenas; miniaturas em ~/wpm_tmp/thumbnails
-python ~/wpm_bdc.py process   # digite o número da cena: 1, 1,3 ou 2-4
+python ~/wpm_download.py check     # 1ª vez descompacta o pacote; deve terminar em "RESULT: ready"
+python ~/wpm_download.py search    # lista as cenas; miniaturas em ~/wpm_tmp/thumbnails
+python ~/wpm_download.py process   # digite o número da cena: 1, 1,3 ou 2-4
 ```
 
 Os produtos ficam em `~/wpm_output` (ex.: `CBERS_4A_WPM_20250712_207_133_L4_RGB_800_8bit.jp2`). Uma cena por tile em cada data; cenas da mesma data viram mosaico.
@@ -49,7 +49,7 @@ A pasta `~/wpm_output` recebe só as imagens. No JP2, mantenha o `.aux.xml` junt
 Coloque os IDs das cenas em `SCENE_IDS` e rode em segundo plano:
 
 ```bash
-nohup python ~/wpm_bdc.py process > ~/wpm_tmp/run.txt 2>&1 &
+nohup python ~/wpm_download.py process > ~/wpm_tmp/run.txt 2>&1 &
 tail -f ~/wpm_tmp/run.txt
 ```
 
