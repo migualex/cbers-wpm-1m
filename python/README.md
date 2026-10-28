@@ -1,6 +1,4 @@
-# WPM 1 m no Brazil Data Cube
-
-Roda o WPM 1 m no BDC-Lab pelo terminal, sem QGIS: 3 arquivos, 1 configuração, 3 comandos.
+# WPM 1 m no BDC-Lab
 
 ## 1. Arquivos
 
